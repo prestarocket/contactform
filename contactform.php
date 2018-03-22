@@ -52,13 +52,125 @@ class Contactform extends Module implements WidgetInterface
 
     public function install()
     {
-        return parent::install();
+        return parent::install()
+        && $this->registerHook('displayBeforeBodyClosingTag')
+        && $this->registerHook('displayHeader');
+    }
+
+    public function hookDisplayHeader($hook_args)
+    {
+        if ($this->context->controller->php_self === 'contact') {
+            $this->context->controller->registerJavascript('captcha.js', 'https://www.google.com/recaptcha/api.js?onload=cbRecaptcha&render=explicit', array('server' => 'remote'));
+            $this->context->controller->registerJavascript('modules-recaptcha', 'modules/'.$this->name.'/views/js/recaptcha.js', ['position' => 'bottom', 'priority' => 150]);
+        }
+    }
+
+    public function getContent()
+    {
+        if(!$this->isRegisteredInHook('displayHeader')) {
+            $this->registerHook('displayHeader');
+        }
+
+        if(!$this->isRegisteredInHook('displayBeforeBodyClosingTag')) {
+            $this->registerHook('displayBeforeBodyClosingTag');
+        }
+
+        
+        $output = null;
+        if (Tools::isSubmit('submit'.$this->name)) {
+            $conv_value = strval(Tools::getValue('PR_CAPTCHA_SECRET'));
+            if (!$conv_value || empty($conv_value)) {
+                $output .= $this->displayError($this->trans('Invalid Configuration value', array(), 'Modules.Contactform.Shop'));
+            } else {
+                Configuration::updateValue('PR_CAPTCHA_SECRET', $conv_value);
+                $output .= $this->displayConfirmation($this->trans('Settings updated', array(), 'Modules.Contactform.Shop'));
+            }
+
+            $conv_value = strval(Tools::getValue('PR_CAPTCHA_PUBLIC'));
+            if (!$conv_value || empty($conv_value)) {
+                $output .= $this->displayError($this->trans('Invalid Configuration value', array(), 'Modules.Contactform.Shop'));
+            } else {
+                Configuration::updateValue('PR_CAPTCHA_PUBLIC', $conv_value);
+                $output .= $this->displayConfirmation($this->trans('Settings updated', array(), 'Modules.Contactform.Shop'));
+            }
+        }
+
+        $output .= '<div style="font-size: 1.3em; padding: 15px;">';
+        $output .= '<p>'.$this->trans('This module adds Google reCaptcha scripts to your site. Your site must have google API access to use ReCaptcha', array(), 'Modules.Contactform.Shop').'</p>';
+        $output .= '<p>'.$this->trans('You can obtain them from this URL', array(), 'Modules.Contactform.Shop').' <a href="https://www.google.com/recaptcha/admin">https://www.google.com/recaptcha/admin</a></p>';
+        $output .= '</div>';
+
+        return $this->renderForm().$output;
+    }
+
+    public function renderForm()
+    {
+
+        $default_lang = (int) Configuration::get('PS_LANG_DEFAULT');
+        $fields_form[0]['form'] = array(
+            'legend' => array(
+                'title' => $this->trans('Settings'),
+            ),
+            'input' => array(
+                array(
+                    'type' => 'text',
+                    'label' => $this->trans('Site Key', array(), 'Modules.Contactform.Shop'),
+                    'name' => 'PR_CAPTCHA_PUBLIC',
+                    'size' => 60,
+                    'required' => true
+                ),
+                array(
+                    'type' => 'text',
+                    'label' => $this->trans('Secret Key', array(), 'Modules.Contactform.Shop'),
+                    'name' => 'PR_CAPTCHA_SECRET',
+                    'size' => 60,
+                    'required' => true
+                )
+            ),
+            'submit' => array(
+                'title' => $this->trans('Save'),
+                'class' => 'button btn btn-default pull-right'
+            )
+        );
+        $helper = new HelperForm();
+        $helper->module = $this;
+        $helper->name_controller = $this->name;
+        $helper->token = Tools::getAdminTokenLite('AdminModules');
+        $helper->currentIndex = AdminController::$currentIndex.'&configure='.$this->name;
+        $helper->default_form_language = $default_lang;
+        $helper->allow_employee_form_lang = $default_lang;
+        $helper->title = $this->displayName;
+        $helper->show_toolbar = true;
+        $helper->toolbar_scroll = true;
+        $helper->submit_action = 'submit'.$this->name;
+        $helper->toolbar_btn = array(
+            'save' => array(
+                'desc' => $this->trans('Save'),
+                'href' => AdminController::$currentIndex.'&configure='.$this->name.'&save'.$this->name.
+                '&token='.Tools::getAdminTokenLite('AdminModules'),
+            ),
+            'back' => array(
+                'href' => AdminController::$currentIndex.'&token='.Tools::getAdminTokenLite('AdminModules'),
+                'desc' => $this->trans('Back to list')
+            )
+        );
+        $helper->fields_value['PR_CAPTCHA_SECRET'] = Configuration::get('PR_CAPTCHA_SECRET');
+        $helper->fields_value['PR_CAPTCHA_PUBLIC'] = Configuration::get('PR_CAPTCHA_PUBLIC');
+
+        return $helper->generateForm($fields_form);
     }
 
     public function renderWidget($hookName = null, array $configuration = [])
     {
+        if($hookName == 'displayBeforeBodyClosingTag'){
+            $this->smarty->assign($this->getWidgetVariables($hookName, $configuration));
+            return $this->display(__FILE__, 'views/templates/widget/recaptchafield.tpl');
+
+        }else{
+
         $this->smarty->assign($this->getWidgetVariables($hookName, $configuration));
         return $this->display(__FILE__, 'views/templates/widget/contactform.tpl');
+        }
     }
 
     public function getWidgetVariables($hookName = null, array $configuration = [])
@@ -106,6 +218,7 @@ class Contactform extends Module implements WidgetInterface
         return [
             'contact' => $this->contact,
             'notifications' => $notifications,
+            'recap_public' => Configuration::get('PR_CAPTCHA_PUBLIC')
         ];
     }
 
@@ -158,13 +271,62 @@ class Contactform extends Module implements WidgetInterface
         return $orders;
     }
 
+    public function verifyReCaptcha($param)
+    {
+        /**
+         * Taken from: https://github.com/google/recaptcha/blob/master/src/ReCaptcha/RequestMethod/Post.php
+         * PHP 5.6.0 changed the way you specify the peer name for SSL context options.
+         * Using "CN_name" will still work, but it will raise deprecated errors.
+         */
+        $peer_key = version_compare(PHP_VERSION, '5.6.0', '<') ? 'CN_name' : 'peer_name';
+        $options = array(
+            'http' => array(
+                'header' => "Content-type: application/x-www-form-urlencoded\r\n",
+                'method' => 'POST',
+                'content' => http_build_query($param),
+                // Force the peer to validate (not needed in 5.6.0+, but still works)
+                'verify_peer' => true,
+                // Force the peer validation to use www.google.com
+                $peer_key => 'www.google.com',
+            ),
+        );
+        $context = stream_context_create($options);
+        return json_decode(file_get_contents('https://www.google.com/recaptcha/api/siteverify', false, $context), true);
+    }
+
+    public function reCapchaErrorTrnslate($error_code)
+    {
+        $r = array(
+            'invalid-input-secret' => $this->trans('The secret parameter is missing.', array(), 'Modules.Contactform.Shop'),
+            'missing-input-response' => $this->trans('The secret parameter is invalid or malformed.', array(), 'Modules.Contactform.Shop'),
+            'invalid-input-response' => $this->trans('The response parameter is missing.', array(), 'Modules.Contactform.Shop'),
+            'bad-request' => $this->trans('The response parameter is invalid or malformed.', array(), 'Modules.Contactform.Shop'),
+            'missing-input-secret' => $this->trans('The request is invalid or malformed', array(), 'Modules.Contactform.Shop'),
+            'timeout-or-duplicate' => $this->trans('You have already submited this form or waited too long to submit it. Refresh page first', array(), 'Modules.Contactform.Shop')
+        );
+        return $r[$error_code];
+    }
+
     public function sendMessage()
     {
         $extension = array('.txt', '.rtf', '.doc', '.docx', '.pdf', '.zip', '.png', '.jpeg', '.gif', '.jpg');
         $file_attachment = Tools::fileAttachment('fileUpload');
         $message = Tools::getValue('message');
 
-        if (!($from = trim(Tools::getValue('from'))) || !Validate::isEmail($from)) {
+        if (Configuration::get('PR_CAPTCHA_PUBLIC') && Configuration::get('PR_CAPTCHA_SECRET')) {
+            $response = $this->verifyReCaptcha(array(
+                'secret' => Configuration::get('PR_CAPTCHA_SECRET'),
+                'response' => Tools::getValue('g-recaptcha-response'),
+                'remoteip' => $_SERVER["REMOTE_ADDR"],
+            ));
+        }
+
+        if (isset($response) && isset($response['success']) && !$response['success']) {
+            $this->context->controller->errors[] = Tools::displayError($this->trans('Le captcha n\'est pas validé', array(), 'Modules.Contactform.Shop'));
+            // foreach ($response['error-codes'] as $erc) {
+            //     $this->context->controller->errors[] = $this->reCapchaErrorTrnslate($erc);
+            // }
+        } elseif (!($from = trim(Tools::getValue('from'))) || !Validate::isEmail($from)) {
             $this->context->controller->errors[] = $this->trans('Invalid email address.', array(), 'Shop.Notifications.Error');
         } elseif (!$message) {
             $this->context->controller->errors[] = $this->trans('The message cannot be blank.', array(), 'Shop.Notifications.Error');
